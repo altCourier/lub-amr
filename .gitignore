@@ -218,6 +218,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Data files
+*.h5
 data/raw/*.h5
 data/processed/*.h5
+data/splits/*.h5
 
+# PyTorch checkpoints and models
+*.pt
+*.pth
