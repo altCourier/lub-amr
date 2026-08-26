@@ -178,3 +178,35 @@ def plot_confusion_matrix(mod_true, mod_pred, mod_names=MOD_NAMES, normalize=Tru
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
     return ax
+
+def plot_accuracy_vs_snr_comparison(results, mod_names=MOD_NAMES, title=None, ax=None):
+    """
+    Overlays the *overall* accuracy-vs-SNR curve for multiple experiments on
+    one axis -- e.g. pooled vs Rma-only vs Umi-only baselines, or later,
+    curriculum variants vs baseline. Unlike plot_accuracy_vs_snr (which shows
+    one model's per-class breakdown), this compares overall accuracy across
+    models, all evaluated on the same test set.
+
+    Parameters
+    ----------
+    results : dict[str, tuple]
+        Maps a label (e.g. "pooled", "rma_only") to a (mod_true, mod_pred, snr)
+        tuple -- the output of collect_predictions() for that model, run on
+        the SAME test loader.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+    for label, (mod_true, mod_pred, snr) in results.items():
+        table = accuracy_vs_snr_table(mod_true, mod_pred, snr, mod_names)
+        snr_levels = sorted(table["overall"].keys())
+        overall_accs = [table["overall"][s] for s in snr_levels]
+        ax.plot(snr_levels, overall_accs, marker="o", label=label)
+
+    ax.set_xlabel("SNR (dB)")
+    ax.set_ylabel("Accuracy")
+    ax.set_ylim(0, 1.05)
+    ax.set_title(title or "Accuracy vs SNR — Comparison")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    return ax

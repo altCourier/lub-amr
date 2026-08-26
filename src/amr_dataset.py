@@ -67,42 +67,62 @@ class AMRDataset(Dataset):
 
     """
 
-    def __init__(self, h5_path, normalize = "per_sample",
-                 global_stats = None, preload = True):
-        
-        self.h5_path = h5_path
-        self.normalize = normalize
-        self.preload = preload
+    def __init__(self, h5_path, normalize="per_sample",
+             global_stats=None, preload=True, domain_filter=None):
+        """
+        ...
+        domain_filter : int or None
+            0 = Rma-only, 1 = Umi-only, None = pooled (no filtering).
+            Filtering is applied on load, before normalization, so per-sample
+            stats and __len__ reflect only the selected domain's rows.
+        """
+
+        self.h5_path       = h5_path
+        self.normalize     = normalize
+        self.preload       = preload
+        self.domain_filter = domain_filter
 
         if normalize == "global" and global_stats is None:
-
             raise ValueError(
                 "normalize='global' requires global_stats=(mean, std), "
                 "computed on the training set and passed explicitly."
             )
-        
+
         self.global_stats = global_stats
 
         if self.preload:
 
             with h5py.File(self.h5_path, "r") as f:
+                data   = f["Data"][:]
+                mods   = f["Mods"][:]
+                snrs   = f["SNRs"][:]
+                domain = f["Domain"][:]
 
-                self.data = f["Data"][:]
-                self.mods = f["Mods"][:]
-                self.snrs = f["SNRs"][:]
-                self.domain = f["Domain"][:]
+            if domain_filter is not None:
+                mask = domain == domain_filter
+                data, mods, snrs, domain = data[mask], mods[mask], snrs[mask], domain[mask]
 
-            self._file = None
+            self.data, self.mods, self.snrs, self.domain = data, mods, snrs, domain
+
+            self._file   = None
+            self.indices = None  # not needed in preload mode, rows already filtered
 
         else:
-            
-            self._file = h5py.File(self.h5_path, "r")
-            self.data = self._file["Data"]
-            self.mods = self._file["Mods"]
-            self.snrs = self._file["SNRs"]
+
+            self._file  = h5py.File(self.h5_path, "r")
+            self.data   = self._file["Data"]
+            self.mods   = self._file["Mods"]
+            self.snrs   = self._file["SNRs"]
             self.domain = self._file["Domain"]
 
-        self.n = self.data.shape[0]
+            if domain_filter is not None:
+                domain_full  = self.domain[:]
+                self.indices = np.where(domain_full == domain_filter)[0]
+
+            else:
+                self.indices = None  # identity mapping, use idx directly
+
+        self.n = self.data.shape[0] if self.indices is None else len(self.indices)
 
     def __len__(self):
 
@@ -128,14 +148,22 @@ class AMRDataset(Dataset):
 
         return torch.from_numpy(iq)
 
-    def __getitem__(self, idx):
+    def _row(self, idx):
+        """
+        Resolve a dataset-local idx to the underlying h5 row index.
+        """
 
-        complex_row = self.data[idx]
+        return idx if self.indices is None else self.indices[idx]
+
+    def __getitem__(self, idx):
+        row = self._row(idx)
+
+        complex_row = self.data[row]
         iq_tensor   = self._to_iq_tensor(complex_row)
 
-        mod_label = torch.tensor(np.argmax(self.mods[idx]), dtype = torch.long)
-        snr       = torch.tensor(self.snrs[idx], dtype = torch.float32)
-        domain    = torch.tensor(self.domain[idx], dtype = torch.long)
+        mod_label = torch.tensor(np.argmax(self.mods[row]), dtype = torch.long)
+        snr       = torch.tensor(self.snrs[row], dtype = torch.float32)
+        domain    = torch.tensor(self.domain[row], dtype = torch.long)
 
         return iq_tensor, mod_label, snr, domain
 

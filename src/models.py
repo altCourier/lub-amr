@@ -77,3 +77,87 @@ class BaselineCNN(nn.Module):
         logits = self.classifier(x)     # (batch, n_classes)
 
         return logits
+
+class CNNLSTM(nn.Module):
+    """
+
+    CNN + LSTM variant for AMR. Same convolutional backbone as BaselineCNN,
+    but replaces global-average-pooling with an LSTM that reads the (128, 128)
+    feature sequence step by step before classifying.
+
+    Rationale: BaselineCNN's global-average-pool collapses the sequence
+    dimension by averaging, which discards *where* along the sequence things
+    happened. For high-order QAM (16/64/256), the classes differ mainly by
+    constellation density -- a subtler, more structure-dependent signal than
+    the coarse energy/spread differences that separate BPSK/QPSK. This variant
+    tests whether preserving sequence structure through an LSTM (instead of
+    averaging it away) helps recover that signal.
+
+    Input:  (batch, 2, 1024)   -- I/Q channels
+    Output: (batch, n_classes) -- raw logits (use CrossEntropyLoss, not softmax)
+
+    """
+
+    def __init__(self, n_classes: int = N_CLASSES, dropout: float = 0.3,
+                 lstm_hidden: int = 128, lstm_layers: int = 1, bidirectional: bool = True):
+
+        super().__init__()
+
+        # identical to BaselineCNN's conv_block: (2, 1024) -> (128, 128)
+        self.conv_block = nn.Sequential(
+
+            # block 1: (2, 1024) -> (64, 512)
+            nn.Conv1d(in_channels=2, out_channels=64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=2),
+
+            # block 2: (64, 512) -> (128, 256)
+            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=2),
+
+            # block 3: (128, 256) -> (128, 128)
+            nn.Conv1d(in_channels=128, out_channels=128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=2),
+        )
+
+        # reads the 128-step feature sequence (each step: 128-dim) instead of
+        # averaging it away. batch_first=True to match (batch, seq, feature).
+        self.lstm = nn.LSTM(
+            input_size=128,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+        )
+
+        lstm_out_dim = lstm_hidden * (2 if bidirectional else 1)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(lstm_out_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(64, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        # x: (batch, 2, 1024)
+
+        x = self.conv_block(x)              # (batch, 128, 128) = (batch, channels, seq_len)
+        x = x.transpose(1, 2)               # (batch, seq_len, channels) -- LSTM wants features last
+
+        lstm_out, (h_n, c_n) = self.lstm(x) # lstm_out: (batch, seq_len, lstm_out_dim)
+
+        # use the last time step's output (both directions already concatenated
+        # by PyTorch when bidirectional=True) rather than averaging over time,
+        # so temporal position information isn't discarded the way avg-pool does
+        last_step = lstm_out[:, -1, :]      # (batch, lstm_out_dim)
+
+        logits = self.classifier(last_step) # (batch, n_classes)
+
+        return logits
