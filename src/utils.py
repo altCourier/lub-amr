@@ -23,7 +23,7 @@ def get_device() -> torch.device:
 def load_best_model(run_name, model_cls=BaselineCNN, device=torch.device, CHECKPOINT_DIR = CHECKPOINT_DIR):
 
     ckpt_path = CHECKPOINT_DIR / f"{run_name}_best.pt"
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
     m = model_cls().to(device)
     m.load_state_dict(ckpt["model_state_dict"])
