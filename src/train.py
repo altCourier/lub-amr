@@ -29,27 +29,34 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torchmetrics.classification import MulticlassAccuracy, MulticlassConfusionMatrix
 
 from amr_dataset import AMRDataset
 from models import BaselineCNN
 from paths import TRAIN_PATH, VAL_PATH, PROJECT_ROOT, CHECKPOINT_DIR
 from utils import get_device
 
-def run_one_epoch(model, loader, criterion, optimizer, device, train: bool):
+def run_one_epoch(model, loader, criterion, optimizer, device, train: bool,
+                   acc_metric=None, cm_metric=None):
     """
         Runs a single pass over `loader`.
     
         If train=True, updates model weights;
         If train=False (validation), runs in eval/no_grad mode and does not
             update weights. 
+
+        acc_metric / cm_metric : torchmetrics objects or None
+            If provided, updated on every batch (train or val) so callers can
+            track accuracy/confusion for either phase. Caller is responsible
+            for calling .reset() before the epoch and .compute() after.
     
-        Returns (avg_loss, accuracy) for the epoch.
+        Returns (avg_loss, accuracy) for the epoch. accuracy is None if no
+        acc_metric was passed in.
     """
 
     model.train() if train else model.eval()
 
     total_loss = 0.0
-    total_correct = 0
     total_samples = 0
 
     context = torch.enable_grad() if train else torch.no_grad()
@@ -70,14 +77,17 @@ def run_one_epoch(model, loader, criterion, optimizer, device, train: bool):
                 loss.backward()
                 optimizer.step()
 
-            batch_size = iq.size(0)
+            if acc_metric is not None:
+                acc_metric.update(logits, mod_label)
+            if cm_metric is not None:
+                cm_metric.update(logits, mod_label)
 
+            batch_size = iq.size(0)
             total_loss += loss.item() * batch_size
-            total_correct += (logits.argmax(dim=1) == mod_label).sum().item()
             total_samples += batch_size
 
     avg_loss = total_loss / total_samples
-    accuracy = total_correct / total_samples
+    accuracy = acc_metric.compute().item() if acc_metric is not None else None
 
     return avg_loss, accuracy
 
@@ -108,9 +118,11 @@ def train_model(
             "baseline_rma_only", "baseline_umi_only".
 
         domain_filter : int or None
-            Passed through to AMRDataset if/when domain filtering is added there
-            (0=Rma, 1=Umi, None=pooled). Currently a placeholder for the
-            Rma-only / Umi-only baseline runs (TBD)
+            0 = Rma, 1 = Umi, None = pooled. Applied to both train_ds and
+            val_ds so early stopping/checkpointing reflect the same domain
+            being trained on. test.h5 stays unfiltered/pooled at eval time
+            for every variant, so all baselines are compared on the same
+            fixed test set.
 
         patience : int
             Stop early if validation accuracy doesn't improve for this many
@@ -119,25 +131,20 @@ def train_model(
     Returns
     -------
     history : dict with keys "train_loss", "train_acc", "val_loss", "val_acc",
-        each a list of per-epoch values.
+        each a list of per-epoch values. Also stores the final validation
+        confusion matrix under history["val_confusion_matrix"] (row-normalized
+        5x5 numpy array, from the best/last epoch run).
     """
     
     device = get_device()
     print(f"Using device: {device}")
 
     if domain_filter is not None:
-        # domain_filter : int or None
-        #     0 = Rma, 1 = Umi, None = pooled. 
-        #     Applied to both train_ds and val_ds so
-        #     early stopping/checkpointing reflect the same domain being trained
-        #     on. test.h5 stays unfiltered/pooled at eval time for every variant,
-        #     so all baselines are compared on the same fixed test set.
-
         train_ds = AMRDataset(str(train_path), normalize = normalize, domain_filter = domain_filter)
         val_ds   = AMRDataset(str(val_path), normalize = normalize, domain_filter = domain_filter)
-
-    train_ds = AMRDataset(str(train_path), normalize = normalize)
-    val_ds   = AMRDataset(str(val_path), normalize = normalize)
+    else:
+        train_ds = AMRDataset(str(train_path), normalize = normalize)
+        val_ds   = AMRDataset(str(val_path), normalize = normalize)
 
     train_loader = DataLoader(
         train_ds, batch_size = batch_size, shuffle = True,
@@ -153,22 +160,36 @@ def train_model(
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    n_classes = train_ds.mods.shape[1]
+    train_acc_metric = MulticlassAccuracy(num_classes=n_classes, average="micro").to(device)
+    val_acc_metric   = MulticlassAccuracy(num_classes=n_classes, average="micro").to(device)
+    val_cm_metric    = MulticlassConfusionMatrix(num_classes=n_classes, normalize="true").to(device)
+
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     checkpoint_path = CHECKPOINT_DIR / f"{run_name}_best.pt"
 
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [],
+               "val_confusion_matrix": None}
     best_val_acc = 0.0
     epochs_without_improvement = 0
 
     for epoch in range(1, epochs + 1):
         start = time.time()
 
+        train_acc_metric.reset()
         train_loss, train_acc = run_one_epoch(
-            model, train_loader, criterion, optimizer, device, train=True
+            model, train_loader, criterion, optimizer, device, train=True,
+            acc_metric=train_acc_metric
         )
+
+        val_acc_metric.reset()
+        val_cm_metric.reset()
         val_loss, val_acc = run_one_epoch(
-            model, val_loader, criterion, optimizer, device, train=False
+            model, val_loader, criterion, optimizer, device, train=False,
+            acc_metric=val_acc_metric, cm_metric=val_cm_metric
         )
+
+        confusion_matrix = val_cm_metric.compute().cpu().numpy()
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
@@ -186,11 +207,13 @@ def train_model(
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             epochs_without_improvement = 0
+            history["val_confusion_matrix"] = confusion_matrix
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "val_acc": val_acc,
+                    "val_confusion_matrix": confusion_matrix,
                     "run_name": run_name,
                 },
                 checkpoint_path,
