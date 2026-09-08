@@ -156,7 +156,10 @@ class CNNLSTM(nn.Module):
         # use the last time step's output (both directions already concatenated
         # by PyTorch when bidirectional=True) rather than averaging over time,
         # so temporal position information isn't discarded the way avg-pool does
-        last_step = lstm_out[:, -1, :]      # (batch, lstm_out_dim)
+        if self.lstm.bidirectional:
+            last_step = torch.cat([h_n[-2], h_n[-1]], dim=1)  # (batch, 2*hidden)
+        else:
+            last_step = h_n[-1]                                # (batch, hidden)
 
         logits = self.classifier(last_step) # (batch, n_classes)
 
